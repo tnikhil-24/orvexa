@@ -1,0 +1,30 @@
+version: '3.9'
+
+services:
+
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: orvexa_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: orvexa
+      POSTGRES_USER: orvexa_user
+      POSTGRES_PASSWORD: orvexa_pass
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./db/init.sql:/docker-entrypoint-initdb.d/init.sql
+
+  redis:
+    image: redis:7-alpine
+    container_name: orvexa_redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+
+volumes:
+  postgres_data:
+  redis_data:
