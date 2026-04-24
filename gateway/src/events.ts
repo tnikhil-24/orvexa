@@ -1,7 +1,6 @@
 import { Server, Socket } from 'socket.io'
 import {
   createRoom,
-  getRoom,
   addParticipant,
   removeParticipant,
   getParticipants,
@@ -9,8 +8,27 @@ import {
 } from './roomManager'
 
 // Track who is typing per room
-// key = roomSlug, value = Set of display names currently typing
 const typingUsers = new Map<string, Set<string>>()
+
+// Track board state per room (in memory)
+// key = roomSlug, value = array of cards
+interface BoardCard {
+  id: string
+  type: 'aria' | 'manual'
+  agentType?: string
+  title: string
+  content: string
+  sourceUrl?: string
+  sourceTitle?: string
+  confidenceScore?: number
+  hasConflict?: boolean
+  pinned: boolean
+  position: { x: number; y: number }
+  createdBy: string
+  createdAt: string
+}
+
+const boardState = new Map<string, BoardCard[]>()
 
 export function registerEvents(io: Server, socket: Socket): void {
 
@@ -28,6 +46,7 @@ export function registerEvents(io: Server, socket: Socket): void {
       success: boolean
       error?: string
       participants?: ReturnType<typeof getParticipants>
+      board?: BoardCard[]
     }) => void
   ) => {
     const { slug, displayName } = data
@@ -57,20 +76,25 @@ export function registerEvents(io: Server, socket: Socket): void {
     socket.data.slug = slug
     socket.data.displayName = displayName.trim()
 
-    // Initialize typing tracker for this room if needed
     if (!typingUsers.has(slug)) {
       typingUsers.set(slug, new Set())
     }
 
+    // Initialize board for this room if needed
+    if (!boardState.has(slug)) {
+      boardState.set(slug, [])
+    }
+
     const participants = getParticipants(slug)
+    const board = boardState.get(slug) || []
+
     console.log(`[room:join] ${displayName} joined room: ${slug} (${participants.length} total)`)
 
-    callback({ success: true, participants })
+    // Send participant list AND current board state to joining user
+    callback({ success: true, participants, board })
 
-    // Tell everyone else someone joined
     socket.to(slug).emit('room:presence', { participants })
 
-    // Announce in chat that someone joined
     io.to(slug).emit('chat:system', {
       message: `${displayName.trim()} joined the room`,
       timestamp: new Date().toISOString(),
@@ -88,14 +112,12 @@ export function registerEvents(io: Server, socket: Socket): void {
     if (!content || content.length === 0) return
     if (content.length > 1000) return
 
-    // Clear typing indicator for this user when they send
     const typing = typingUsers.get(slug)
     if (typing) {
       typing.delete(displayName)
       io.to(slug).emit('chat:typing', { users: Array.from(typing) })
     }
 
-    // Detect if this is an @ARIA trigger
     const isAriatrigger = content.toLowerCase().startsWith('@aria')
 
     const message = {
@@ -110,25 +132,84 @@ export function registerEvents(io: Server, socket: Socket): void {
 
     console.log(`[chat:message] ${displayName} in ${slug}: ${content.substring(0, 50)}`)
 
-    // Broadcast to everyone in the room INCLUDING sender
     io.to(slug).emit('chat:message', message)
 
-    // If @ARIA was triggered, send a placeholder response for now
     if (isAriatrigger) {
+      const query = content.replace(/@aria\s*/i, '').trim()
+
+      io.to(slug).emit('aria:status', { status: 'searching' })
+
+      // Simulate ARIA dropping cards onto the board (placeholder until Week 3)
       setTimeout(() => {
+        const cards: BoardCard[] = [
+          {
+            id: `card-${Date.now()}-1`,
+            type: 'aria',
+            agentType: 'search',
+            title: `Search result for: "${query}"`,
+            content: 'Real search results coming in Week 3 when the Python agent server is connected.',
+            sourceUrl: 'https://example.com',
+            sourceTitle: 'Example Source',
+            confidenceScore: 0.85,
+            hasConflict: false,
+            pinned: false,
+            position: { x: 80, y: 80 },
+            createdBy: 'ARIA',
+            createdAt: new Date().toISOString(),
+          },
+          {
+            id: `card-${Date.now()}-2`,
+            type: 'aria',
+            agentType: 'summary',
+            title: 'AI Summary',
+            content: `Summary of findings for "${query}" will appear here once agents are connected.`,
+            confidenceScore: 0.78,
+            hasConflict: false,
+            pinned: false,
+            position: { x: 340, y: 80 },
+            createdBy: 'ARIA',
+            createdAt: new Date().toISOString(),
+          },
+          {
+            id: `card-${Date.now()}-3`,
+            type: 'aria',
+            agentType: 'factcheck',
+            title: 'Fact Check',
+            content: 'Fact-check results will appear here. Confidence scores and conflict flags coming in Week 3.',
+            confidenceScore: 0.91,
+            hasConflict: false,
+            pinned: false,
+            position: { x: 600, y: 80 },
+            createdBy: 'ARIA',
+            createdAt: new Date().toISOString(),
+          },
+        ]
+
+        // Add cards to board state
+        const board = boardState.get(slug) || []
+        cards.forEach(card => board.push(card))
+        boardState.set(slug, board)
+
+        // Stream cards one by one with delay — the "live appearance" effect
+        cards.forEach((card, index) => {
+          setTimeout(() => {
+            io.to(slug).emit('board:card:new', { card })
+          }, index * 600)
+        })
+
+        // ARIA chat response
         io.to(slug).emit('chat:message', {
           id: `aria-${Date.now()}`,
           senderId: 'aria',
           senderName: 'ARIA',
-          content: `Got it. Searching for: "${content.replace(/@aria\s*/i, '')}"... (Agent coming in Week 3)`,
+          content: `Searching for "${query}"... dropping findings onto the board.`,
           timestamp: new Date().toISOString(),
           isAria: true,
           isAriatrigger: false,
         })
+
         io.to(slug).emit('aria:status', { status: 'idle' })
       }, 1500)
-
-      io.to(slug).emit('aria:status', { status: 'searching' })
     }
   })
 
@@ -155,6 +236,88 @@ export function registerEvents(io: Server, socket: Socket): void {
 
     typing.delete(displayName)
     socket.to(slug).emit('chat:typing', { users: Array.from(typing) })
+  })
+
+  // ── BOARD: CARD PIN ───────────────────────────────────────
+  socket.on('board:card:pin', (data: { cardId: string; pinned: boolean }) => {
+    const slug = socket.data.slug
+    if (!slug) return
+
+    const board = boardState.get(slug)
+    if (!board) return
+
+    const card = board.find(c => c.id === data.cardId)
+    if (card) {
+      card.pinned = data.pinned
+      // Broadcast to everyone including sender
+      io.to(slug).emit('board:card:update', { cardId: data.cardId, pinned: data.pinned })
+      console.log(`[board:pin] card ${data.cardId} pinned=${data.pinned} in ${slug}`)
+    }
+  })
+
+  // ── BOARD: CARD DISMISS ───────────────────────────────────
+  socket.on('board:card:dismiss', (data: { cardId: string }) => {
+    const slug = socket.data.slug
+    if (!slug) return
+
+    const board = boardState.get(slug)
+    if (!board) return
+
+    const index = board.findIndex(c => c.id === data.cardId)
+    if (index !== -1) {
+      board.splice(index, 1)
+      io.to(slug).emit('board:card:dismiss', { cardId: data.cardId })
+      console.log(`[board:dismiss] card ${data.cardId} dismissed in ${slug}`)
+    }
+  })
+
+  // ── BOARD: CARD MOVE ──────────────────────────────────────
+  socket.on('board:card:move', (data: { cardId: string; x: number; y: number }) => {
+    const slug = socket.data.slug
+    if (!slug) return
+
+    const board = boardState.get(slug)
+    if (!board) return
+
+    const card = board.find(c => c.id === data.cardId)
+    if (card) {
+      card.position = { x: data.x, y: data.y }
+      // Last-write-wins: broadcast to everyone EXCEPT sender
+      socket.to(slug).emit('board:card:move', {
+        cardId: data.cardId,
+        x: data.x,
+        y: data.y,
+      })
+    }
+  })
+
+  // ── BOARD: MANUAL CARD ────────────────────────────────────
+  socket.on('board:card:add', (data: { title: string; content: string }) => {
+    const slug = socket.data.slug
+    const displayName = socket.data.displayName
+    if (!slug || !displayName) return
+
+    const title = data.title?.trim()
+    const content = data.content?.trim()
+    if (!title || !content) return
+
+    const card: BoardCard = {
+      id: `manual-${Date.now()}-${socket.id}`,
+      type: 'manual',
+      title,
+      content,
+      pinned: false,
+      position: { x: 80 + Math.random() * 200, y: 200 + Math.random() * 100 },
+      createdBy: displayName,
+      createdAt: new Date().toISOString(),
+    }
+
+    const board = boardState.get(slug) || []
+    board.push(card)
+    boardState.set(slug, board)
+
+    io.to(slug).emit('board:card:new', { card })
+    console.log(`[board:add] manual card added by ${displayName} in ${slug}`)
   })
 
   // ── ROOM: LEAVE ──────────────────────────────────────────
