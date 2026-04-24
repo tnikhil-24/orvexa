@@ -141,9 +141,10 @@ export function registerEvents(io: Server, socket: Socket): void {
 
       // Simulate ARIA dropping cards onto the board (placeholder until Week 3)
       setTimeout(() => {
+        const ts = Date.now()
         const cards: BoardCard[] = [
           {
-            id: `card-${Date.now()}-1`,
+            id: `card-${ts}-1`,
             type: 'aria',
             agentType: 'search',
             title: `Search result for: "${query}"`,
@@ -158,7 +159,7 @@ export function registerEvents(io: Server, socket: Socket): void {
             createdAt: new Date().toISOString(),
           },
           {
-            id: `card-${Date.now()}-2`,
+            id: `card-${ts}-2`,
             type: 'aria',
             agentType: 'summary',
             title: 'AI Summary',
@@ -171,7 +172,7 @@ export function registerEvents(io: Server, socket: Socket): void {
             createdAt: new Date().toISOString(),
           },
           {
-            id: `card-${Date.now()}-3`,
+            id: `card-${ts}-3`,
             type: 'aria',
             agentType: 'factcheck',
             title: 'Fact Check',
