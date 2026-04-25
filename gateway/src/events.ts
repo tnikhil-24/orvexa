@@ -24,11 +24,49 @@ interface BoardCard {
   hasConflict?: boolean
   pinned: boolean
   position: { x: number; y: number }
+  sessionId?: string
+  queryText?: string
   createdBy: string
   createdAt: string
 }
 
 const boardState = new Map<string, BoardCard[]>()
+
+// ── Grid constants ────────────────────────────────────────────
+const COLS     = 3
+const CARD_W   = 260  // card width (240px) + gap (20px)
+const ROW_H    = 180
+const ORIGIN_X = 80
+const ORIGIN_Y = 80
+
+function findFreePosition(
+  existingCards: BoardCard[],
+  slotIndex: number
+): { x: number; y: number } {
+  const occupied = new Set<string>()
+  for (const card of existingCards) {
+    const col = Math.round((card.position.x - ORIGIN_X) / CARD_W)
+    const row = Math.round((card.position.y - ORIGIN_Y) / ROW_H)
+    if (col >= 0 && col < COLS && row >= 0) {
+      occupied.add(`${col},${row}`)
+    }
+  }
+
+  let found = 0
+  for (let row = 0; row < 100; row++) {
+    for (let col = 0; col < COLS; col++) {
+      if (!occupied.has(`${col},${row}`)) {
+        if (found === slotIndex) {
+          return { x: ORIGIN_X + col * CARD_W, y: ORIGIN_Y + row * ROW_H }
+        }
+        found++
+      }
+    }
+  }
+
+  // Fallback: should never be reached with a 100-row grid
+  return { x: ORIGIN_X + (slotIndex % COLS) * CARD_W, y: ORIGIN_Y + Math.floor(slotIndex / COLS) * ROW_H }
+}
 
 export function registerEvents(io: Server, socket: Socket): void {
 
@@ -142,6 +180,10 @@ export function registerEvents(io: Server, socket: Socket): void {
       // Simulate ARIA dropping cards onto the board (placeholder until Week 3)
       setTimeout(() => {
         const ts = Date.now()
+        const board = boardState.get(slug) || []
+        const sessionId = `session-${ts}`
+        const queryText = query
+
         const cards: BoardCard[] = [
           {
             id: `card-${ts}-1`,
@@ -154,7 +196,9 @@ export function registerEvents(io: Server, socket: Socket): void {
             confidenceScore: 0.85,
             hasConflict: false,
             pinned: false,
-            position: { x: 80, y: 80 },
+            position: findFreePosition(board, 0),
+            sessionId,
+            queryText,
             createdBy: 'ARIA',
             createdAt: new Date().toISOString(),
           },
@@ -167,7 +211,9 @@ export function registerEvents(io: Server, socket: Socket): void {
             confidenceScore: 0.78,
             hasConflict: false,
             pinned: false,
-            position: { x: 340, y: 80 },
+            position: findFreePosition(board, 1),
+            sessionId,
+            queryText,
             createdBy: 'ARIA',
             createdAt: new Date().toISOString(),
           },
@@ -180,14 +226,15 @@ export function registerEvents(io: Server, socket: Socket): void {
             confidenceScore: 0.91,
             hasConflict: false,
             pinned: false,
-            position: { x: 600, y: 80 },
+            position: findFreePosition(board, 2),
+            sessionId,
+            queryText,
             createdBy: 'ARIA',
             createdAt: new Date().toISOString(),
           },
         ]
 
         // Add cards to board state
-        const board = boardState.get(slug) || []
         cards.forEach(card => board.push(card))
         boardState.set(slug, board)
 
@@ -310,18 +357,19 @@ export function registerEvents(io: Server, socket: Socket): void {
     const content = data.content?.trim()
     if (!title || !content) return
 
+    const board = boardState.get(slug) || []
+
     const card: BoardCard = {
       id: `manual-${Date.now()}-${socket.id}`,
       type: 'manual',
       title,
       content,
       pinned: false,
-      position: { x: 80 + Math.random() * 200, y: 200 + Math.random() * 100 },
+      position: findFreePosition(board, 0),
       createdBy: displayName,
       createdAt: new Date().toISOString(),
     }
 
-    const board = boardState.get(slug) || []
     board.push(card)
     boardState.set(slug, board)
 
