@@ -5,6 +5,7 @@ import cors from 'cors'
 import morgan from 'morgan'
 import dotenv from 'dotenv'
 import { registerEvents } from './events'
+import { initRedisSubscriber } from './redis'
 
 dotenv.config()
 
@@ -36,6 +37,9 @@ const io = new Server(httpServer, {
   pingTimeout: 60000,
   pingInterval: 25000,
 })
+
+// ── REDIS SUBSCRIBER ─────────────────────────────────────────
+initRedisSubscriber(io)
 
 // ── SOCKET CONNECTION ─────────────────────────────────────────
 // Every new browser tab that connects triggers this

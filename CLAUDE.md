@@ -16,8 +16,8 @@ shared visual board that all participants see simultaneously.
 **One-liner for context:** "Figma meets Perplexity — a live research room where AI does
 the searching while your team watches the board fill up in real time."
 
-**Current state:** Week 2 of a 12-week build. Core infrastructure + board polish complete.
-Real AI agents (Tavily + Claude) are NOT yet connected — placeholders exist.
+**Current state:** Week 3 of a 12-week build. Real AI agents live — Tavily search +
+Claude summarization + fact-check stream cards onto the board in real time.
 
 ---
 
@@ -27,7 +27,8 @@ Real AI agents (Tavily + Claude) are NOT yet connected — placeholders exist.
 orvexa/
 ├── frontend/        — Next.js 14 (App Router), Tailwind v4, React Flow
 ├── gateway/         — Node.js + Express + Socket.io (real-time layer)
-├── agent-server/    — Python + FastAPI + arq (AI agents — not built yet)
+├── agent-server/    — Python + FastAPI + arq (AI agents — BUILT Week 3)
+│                      FastAPI on port 8000, arq worker subscribes to Redis
 ├── db/
 │   └── init.sql     — PostgreSQL schema (runs on Docker start)
 ├── docker-compose.yml
@@ -87,8 +88,15 @@ Writing to PostgreSQL comes in Week 7 (Auth + Persistence phase).
 
 ### Python Agent Server
 **Why:** Python has better AI/ML library support than Node.
-**Status:** Folder scaffolded, venv created, packages installed. NO code written yet.
-FastAPI + arq (Redis-backed job queue) will power the agents in Week 3.
+**Status:** Fully built (Week 3). FastAPI accepts trigger requests, arq enqueues jobs,
+three agents run with two-phase parallel execution (search → summarizer + factcheck in
+`asyncio.gather`). Each agent has a 30s timeout; failures produce error cards without
+blocking the others.
+**Critical gotcha:** The arq worker does NOT hot-reload. Restart it after any change to
+`jobs.py` or any file under `agent_server/agents/`.
+**Critical gotcha:** `redis.asyncio.from_url()` is a sync factory — do NOT `await` it.
+**Critical gotcha:** Call `load_dotenv()` before any `os.environ` reads in every agent
+file. The worker imports modules at startup before env vars are guaranteed to be loaded.
 
 ---
 
@@ -103,29 +111,23 @@ Gateway → callback({success, participants, board})
 Gateway → socket.to(slug).emit('room:presence', {participants})
 ```
 
-### @ARIA trigger flow (current — placeholder):
+### @ARIA trigger flow (current — real agents):
 ```
-User types "@ARIA [query]" → Chat.tsx detects → socket.emit('chat:message')
-Gateway receives → detects @ARIA → setTimeout 1500ms
-  → io.to(slug).emit('aria:status', {status: 'searching'})
-  → creates 3 BoardCards with sessionId, queryText, findFreePosition slots
-  → pushes cards to boardState[slug]
-  → io.to(slug).emit('aria:status', {status: 'reading'})
-  → streams cards 1-by-1 via board:card:new, 600ms apart
-  → io.to(slug).emit('chat:message', {isAria: true, content: '...'})
-  → 200ms after last card: aria:status 'done'
-  → 2500ms later: aria:status 'idle'
-```
-
-### @ARIA trigger flow (Week 3 — real agents):
-```
-Gateway → POST /api/aria/trigger to Python agent server
-Python → enqueues job in arq (Redis-backed)
-Python → asyncio.gather() → 3 agents run in parallel:
-  Search agent → Tavily API → publishes to Redis channel room:{slug}:findings
-  Summarizer → Claude Sonnet API → publishes to Redis channel
-  Fact-check → Tavily cross-reference → publishes to Redis channel
-Node gateway → subscribes to Redis channel → socket.io broadcast → board updates
+User types "@ARIA [query]" → Chat.tsx → socket.emit('chat:message')
+Gateway → detects @ARIA → emits aria:status 'searching'
+Gateway → axios.POST http://localhost:8000/api/aria/trigger {slug, query, sessionId}
+FastAPI → enqueues aria_job in arq (Redis-backed queue)
+arq worker → picks up job → runs two-phase execution:
+  Phase 1 (sequential): run_search() → Tavily API → up to 5 results
+    Each result → redis.asyncio.publish(room:{slug}:findings, card JSON)
+  Phase 2 (parallel): asyncio.gather(run_summarizer(), run_factcheck())
+    Both use Phase 1 results → Claude Sonnet API → publish summary + factcheck cards
+  Each phase has 30s timeout → timeout/exception → error card published instead
+  After gather: publish {type:'done'} to Redis channel
+Gateway redis.ts → psubscribe('room:*:findings') → pmessage handler:
+  type 'aria'/'error' → findFreePosition + push boardState + emit board:card:new
+  First card of session → emit aria:status 'reading' (before emitting card)
+  type 'done' → emit aria:status 'done' → 2500ms → emit aria:status 'idle'
 ```
 
 ---
@@ -185,15 +187,42 @@ frontend/
 gateway/
   src/
     index.ts                — Express server + Socket.io setup. Health check at /health
-    events.ts               — ALL socket event handlers. Room, chat, board, ARIA placeholder.
-                              boardState Map<slug, BoardCard[]> for in-memory board.
-                              findFreePosition(existingCards, slotIndex): reverse-maps
-                              card positions to a 3-col grid, returns slotIndex-th free
-                              slot in reading order. ARIA cards tagged with sessionId +
-                              queryText for frontend session clustering.
+    events.ts               — ALL socket event handlers. Room, chat, board events.
+                              Exports boardState + findFreePosition for use by redis.ts.
+                              @ARIA handler: emits 'searching', POSTs to Python, done.
+                              BoardCard.type includes 'error' for agent failure cards.
+    redis.ts                — ioredis subscriber. psubscribe('room:*:findings').
+                              pmessage → parse slug from channel → build card →
+                              push boardState → emit board:card:new. Tracks first card
+                              per session to emit aria:status 'reading' exactly once.
+                              Handles 'done' message → 'done' + 2500ms → 'idle'.
+                              CRITICAL: call psubscribe() directly (not in connect handler)
+                              — ioredis queues it. Putting it in connect re-subscribes
+                              on every reconnect and caused BUG-003 (0 subscribers).
     roomManager.ts          — In-memory room state. Map<slug, Room>. Participant tracking.
 
-agent-server/               — Empty for now. Python FastAPI + arq. Built in Week 3.
+agent-server/
+  agent_server/
+    main.py                 — FastAPI app. POST /api/aria/trigger → enqueue aria_job.
+                              arq pool created in lifespan startup, stored on app.state.
+    worker.py               — arq WorkerSettings. Parses REDIS_URL → RedisSettings.
+                              Run: arq agent_server.worker.WorkerSettings
+                              Must be restarted manually after any code change.
+    jobs.py                 — aria_job: two-phase execution. Phase 1: run_search with
+                              30s timeout. Phase 2: asyncio.gather(summarizer, factcheck)
+                              both with 30s timeouts via _run_with_timeout helper.
+                              Always publishes {type:'done'} at end. max_tries=1.
+    redis_pub.py            — publish_finding(): creates redis.asyncio connection per
+                              call (no module-level caching), publishes JSON, closes.
+                              NOTE: from_url() is sync — do NOT await it.
+    agents/
+      search.py             — Tavily POST /search, max 5 results. Publishes each as
+                              agentType:'search' card. Returns results list for Phase 2.
+      summarizer.py         — Claude Sonnet, top 3 snippets, 2-3 sentence summary.
+                              Empty results → error card, no blank Claude prompt.
+      factcheck.py          — Claude Sonnet, confidence score parsed via regex
+                              r'CONFIDENCE:\s*([0-9]*\.?[0-9]+)', clamped [0,1].
+                              hasConflict set if response contains 'conflict'/'contradicts'.
 
 db/
   init.sql                  — Full PostgreSQL schema. 6 tables: rooms, participants,
@@ -218,7 +247,7 @@ Bounds clamped to container via `clampPos()` in `CardItem`.
 
 ---
 
-## What's Built (Weeks 1–2 Complete)
+## What's Built (Weeks 1–3 Complete)
 
 ### Week 1 — Core infrastructure
 - Room creation → unique slug → shareable URL
@@ -244,13 +273,21 @@ Bounds clamped to container via `clampPos()` in `CardItem`.
 - Content truncation: "Show more / Show less" toggle at 120 chars
 - Board toolbar: live card count + two-click "Clear unpinned" with 3s confirm timeout
 
+### Week 3 — Real ARIA agents
+- Python agent server: FastAPI + arq job queue
+- Redis pub/sub bridge: gateway subscribes to `room:*:findings` via ioredis psubscribe
+- Search agent: Tavily API, up to 5 real web results per query
+- Summarizer agent: Claude Sonnet, 2-3 sentence summary from top 3 snippets
+- Fact-check agent: Claude Sonnet, confidence score + conflict detection
+- Two-phase parallel execution: search → asyncio.gather(summary, factcheck)
+- Per-agent 30s timeouts: timeout/exception produces error card, others continue
+- Error card visual style: red-tinted border + background, red title in Board.tsx
+- `aria:status` lifecycle now data-driven: reading on first Redis card, done on Python signal
+
 ---
 
 ## What's NOT Built Yet
 
-- Real ARIA agents (Tavily + Claude) — Week 3
-- Python agent server — Week 3
-- Redis pub/sub for agent results — Week 3
 - PostgreSQL writes — Week 7
 - Auth (Clerk) — Week 7
 - Report generation — Week 6
@@ -280,6 +317,16 @@ npm run dev
 # Terminal 3 — Frontend
 cd D:\Claude\Projects\orvexa\frontend
 npm run dev
+
+# Terminal 4 — Agent server (FastAPI)
+cd D:\Claude\Projects\orvexa\agent-server
+venv\Scripts\activate
+uvicorn agent_server.main:app --port 8000 --reload
+
+# Terminal 5 — arq worker (NO hot reload — restart manually after code changes)
+cd D:\Claude\Projects\orvexa\agent-server
+venv\Scripts\activate
+arq agent_server.worker.WorkerSettings
 ```
 
 ### Ports:
@@ -326,6 +373,15 @@ npm run dev
 8. **Do not add auth in v1.** Clerk integration is planned for Week 7. All room
    joining is session-based with display names only.
 
+9. **ioredis psubscribe must be called directly, not inside the `connect` handler.**
+   ioredis queues commands until connected. Calling psubscribe in the connect handler
+   causes re-subscription on every reconnect. This was BUG-003 (Week 3) — gateway
+   showed 0 Redis subscribers because the connect event wasn't firing as expected.
+
+10. **arq worker does not hot-reload.** Restart `arq agent_server.worker.WorkerSettings`
+    manually after any change to `jobs.py` or any agent file. uvicorn `--reload` only
+    restarts FastAPI, not the worker process.
+
 ---
 
 ## Build Roadmap Summary
@@ -334,8 +390,8 @@ npm run dev
 |---|---|---|
 | 1 | Room + Chat + Board infrastructure | ✅ Complete |
 | 2 | Board polish + card clustering | ✅ Complete |
-| 3 | Real ARIA agents (Tavily + Claude) | ⬜ Next |
-| 4 | Claude summarization + streaming | ⬜ |
+| 3 | Real ARIA agents (Tavily + Claude) | ✅ Complete |
+| 4 | Claude summarization + streaming | ⬜ Next |
 | 5 | Parallel agents + arq queue | ⬜ |
 | 6 | Synthesizer + Report generation | ⬜ |
 | 7 | Auth (Clerk) + DB persistence | ⬜ |

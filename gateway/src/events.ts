@@ -1,3 +1,4 @@
+import axios from 'axios'
 import { Server, Socket } from 'socket.io'
 import {
   createRoom,
@@ -12,9 +13,9 @@ const typingUsers = new Map<string, Set<string>>()
 
 // Track board state per room (in memory)
 // key = roomSlug, value = array of cards
-interface BoardCard {
+export interface BoardCard {
   id: string
-  type: 'aria' | 'manual'
+  type: 'aria' | 'manual' | 'error'
   agentType?: string
   title: string
   content: string
@@ -30,7 +31,7 @@ interface BoardCard {
   createdAt: string
 }
 
-const boardState = new Map<string, BoardCard[]>()
+export const boardState = new Map<string, BoardCard[]>()
 
 // ── Grid constants ────────────────────────────────────────────
 const COLS     = 3
@@ -39,7 +40,7 @@ const ROW_H    = 180
 const ORIGIN_X = 80
 const ORIGIN_Y = 80
 
-function findFreePosition(
+export function findFreePosition(
   existingCards: BoardCard[],
   slotIndex: number
 ): { x: number; y: number } {
@@ -175,97 +176,33 @@ export function registerEvents(io: Server, socket: Socket): void {
     if (isAriatrigger) {
       const query = content.replace(/@aria\s*/i, '').trim()
 
-      io.to(slug).emit('aria:status', { status: 'searching' })
-
-      // Simulate ARIA dropping cards onto the board (placeholder until Week 3)
-      setTimeout(() => {
-        const ts = Date.now()
-        const board = boardState.get(slug) || []
-        const sessionId = `session-${ts}`
-        const queryText = query
-
-        const cards: BoardCard[] = [
-          {
-            id: `card-${ts}-1`,
-            type: 'aria',
-            agentType: 'search',
-            title: `Search result for: "${query}"`,
-            content: 'Real search results coming in Week 3 when the Python agent server is connected.',
-            sourceUrl: 'https://example.com',
-            sourceTitle: 'Example Source',
-            confidenceScore: 0.85,
-            hasConflict: false,
-            pinned: false,
-            position: findFreePosition(board, 0),
-            sessionId,
-            queryText,
-            createdBy: 'ARIA',
-            createdAt: new Date().toISOString(),
-          },
-          {
-            id: `card-${ts}-2`,
-            type: 'aria',
-            agentType: 'summary',
-            title: 'AI Summary',
-            content: `Summary of findings for "${query}" will appear here once agents are connected.`,
-            confidenceScore: 0.78,
-            hasConflict: false,
-            pinned: false,
-            position: findFreePosition(board, 1),
-            sessionId,
-            queryText,
-            createdBy: 'ARIA',
-            createdAt: new Date().toISOString(),
-          },
-          {
-            id: `card-${ts}-3`,
-            type: 'aria',
-            agentType: 'factcheck',
-            title: 'Fact Check',
-            content: 'Fact-check results will appear here. Confidence scores and conflict flags coming in Week 3.',
-            confidenceScore: 0.91,
-            hasConflict: false,
-            pinned: false,
-            position: findFreePosition(board, 2),
-            sessionId,
-            queryText,
-            createdBy: 'ARIA',
-            createdAt: new Date().toISOString(),
-          },
-        ]
-
-        // Add cards to board state
-        cards.forEach(card => board.push(card))
-        boardState.set(slug, board)
-
-        // Stream cards one by one with delay — the "live appearance" effect
-        io.to(slug).emit('aria:status', { status: 'reading' })
-
-        cards.forEach((card, index) => {
-          setTimeout(() => {
-            io.to(slug).emit('board:card:new', { card })
-          }, index * 600)
-        })
-
-        // ARIA chat response
+      if (!query) {
         io.to(slug).emit('chat:message', {
           id: `aria-${Date.now()}`,
           senderId: 'aria',
           senderName: 'ARIA',
-          content: `Searching for "${query}"... dropping findings onto the board.`,
+          content: 'Please include a question after @ARIA. Example: @ARIA what is quantum computing?',
           timestamp: new Date().toISOString(),
           isAria: true,
           isAriatrigger: false,
         })
+        io.to(slug).emit('aria:status', { status: 'idle' })
+        return
+      }
 
-        // After all cards have streamed: done → idle
-        setTimeout(() => {
-          io.to(slug).emit('aria:status', { status: 'done' })
-          setTimeout(() => {
-            io.to(slug).emit('aria:status', { status: 'idle' })
-          }, 2500)
-        }, (cards.length - 1) * 600 + 200)
-      }, 1500)
+      io.to(slug).emit('aria:status', { status: 'searching' })
+
+      const fallbackTimer = setTimeout(() => {
+        io.to(slug).emit('aria:status', { status: 'idle' })
+      }, 5000)
+
+      axios.post('http://localhost:8000/api/aria/trigger', {
+        slug,
+        query,
+        sessionId: `session-${Date.now()}`,
+      }).then(() => {
+        clearTimeout(fallbackTimer)
+      }).catch(err => console.error('[aria:trigger]', err.message))
     }
   })
 
