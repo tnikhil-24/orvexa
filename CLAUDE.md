@@ -16,7 +16,7 @@ shared visual board that all participants see simultaneously.
 **One-liner for context:** "Figma meets Perplexity — a live research room where AI does
 the searching while your team watches the board fill up in real time."
 
-**Current state:** Week 1 of a 12-week build. Core infrastructure is complete.
+**Current state:** Week 2 of a 12-week build. Core infrastructure + board polish complete.
 Real AI agents (Tavily + Claude) are NOT yet connected — placeholders exist.
 
 ---
@@ -64,10 +64,14 @@ entire canvas on every render, wiping all nodes. This caused our BUG-001 (see be
 `as unknown as Record<string, unknown>` when passing typed card data.
 
 ### State management: useState + Socket events
-**Why:** No Redux/Zustand needed yet. Board state lives in `useState<Node[]>` in Board.tsx.
+**Why:** No Redux/Zustand needed yet. Board state lives in `useState<BoardCard[]>` in Board.tsx.
 Room state (participants) lives in the room page. Chat messages live in Chat.tsx.
 **Pattern:** Socket events drive all state updates. Never mutate state directly.
-Always use functional updates: `setNodes(prev => ...)`.
+Always use functional updates: `setCards(prev => ...)`.
+**Z-index:** `topZ` ref (incrementing counter) + `zIndices` Record<id, number> state.
+`handleBringToFront` on pointer-down. Pinned cards get `base + 1000` offset.
+**Session clustering:** `clusterSessions` derived via `useMemo([cards])` — bounding boxes
+per `sessionId` for sessions with 2+ cards. Rendered as a frame layer under cards.
 
 ### Gateway: Node.js + Express + Socket.io
 **Why:** Node handles WebSockets better than Python for the real-time layer.
@@ -103,10 +107,14 @@ Gateway → socket.to(slug).emit('room:presence', {participants})
 ```
 User types "@ARIA [query]" → Chat.tsx detects → socket.emit('chat:message')
 Gateway receives → detects @ARIA → setTimeout 1500ms
-Gateway → io.to(slug).emit('aria:status', {status: 'searching'})
-Gateway → 3x io.to(slug).emit('board:card:new', {card}) with 600ms gaps
-Gateway → io.to(slug).emit('chat:message', {isAria: true, content: '...'})
-Gateway → io.to(slug).emit('aria:status', {status: 'idle'})
+  → io.to(slug).emit('aria:status', {status: 'searching'})
+  → creates 3 BoardCards with sessionId, queryText, findFreePosition slots
+  → pushes cards to boardState[slug]
+  → io.to(slug).emit('aria:status', {status: 'reading'})
+  → streams cards 1-by-1 via board:card:new, 600ms apart
+  → io.to(slug).emit('chat:message', {isAria: true, content: '...'})
+  → 200ms after last card: aria:status 'done'
+  → 2500ms later: aria:status 'idle'
 ```
 
 ### @ARIA trigger flow (Week 3 — real agents):
@@ -164,8 +172,11 @@ frontend/
     room/[slug]/page.tsx    — Main room page. Manages socket connection, participants,
                               renders Board + Chat + ARIAAvatar + participants sidebar
     components/
-      Board.tsx             — React Flow canvas. Manages node state, socket card events,
-                              drag-to-move sync, pin/dismiss interactions
+      Board.tsx             — Board canvas. React Flow background dots only. Cards are
+                              plain position:absolute divs (BUG-001 fix). Manages:
+                              BoardCard state, z-index stacking, pointer-events drag
+                              with bounds clamping, pin/dismiss animations, session
+                              cluster frames, board toolbar with "Clear unpinned"
       Chat.tsx              — Chat sidebar. Messages, typing indicators, @ARIA highlighting
       ARIAAvatar.tsx        — Animated ARIA avatar. Reacts to aria:status socket events
   lib/
@@ -174,7 +185,12 @@ frontend/
 gateway/
   src/
     index.ts                — Express server + Socket.io setup. Health check at /health
-    events.ts               — ALL socket event handlers. Room, chat, board, ARIA placeholder
+    events.ts               — ALL socket event handlers. Room, chat, board, ARIA placeholder.
+                              boardState Map<slug, BoardCard[]> for in-memory board.
+                              findFreePosition(existingCards, slotIndex): reverse-maps
+                              card positions to a 3-col grid, returns slotIndex-th free
+                              slot in reading order. ARIA cards tagged with sessionId +
+                              queryText for frontend session clustering.
     roomManager.ts          — In-memory room state. Map<slug, Room>. Participant tracking.
 
 agent-server/               — Empty for now. Python FastAPI + arq. Built in Week 3.
@@ -189,26 +205,22 @@ db/
 ## Known Bugs
 
 ### BUG-001: React Flow only renders 1 of 3 ARIA cards visually
-**Status:** Under investigation
-**Symptoms:** Gateway emits all 3 cards (confirmed via logs). React state receives all 3
-(confirmed via console logs). But React Flow only renders 1 visually on screen.
-**Root cause hypothesis:** React Flow internal node reconciliation issue when nodes are
-added rapidly in succession (600ms apart).
-**Current workaround:** None. Cards are in state, just not rendering.
-**Planned fix:** Week 2 — replace React Flow nodes with plain positioned divs for ARIA
-cards. React Flow will be used only for connecting cards with edges (relationships).
-**Do NOT attempt to fix by moving nodeTypes inside the component** — this causes the
-entire canvas to remount and wipe all nodes. nodeTypes MUST stay at module level.
+**Status:** ✅ Resolved (Week 2)
+**Root cause:** React Flow's internal Zustand reconciliation dropped rapid successive
+`setNodes` calls (600ms apart). The internal node map was overwritten before re-render.
+**Fix:** Replaced React Flow nodes with plain `position: absolute` divs in a separate
+overlay div. React Flow is now used only for the background dot grid.
 
 ### BUG-002: Dragging cards doesn't work
-**Status:** Open
-**Likely cause:** Related to BUG-001 — cards not rendering means drag handles don't exist.
-**Will resolve:** When BUG-001 is fixed.
+**Status:** ✅ Resolved (Week 2, side effect of BUG-001 fix)
+**Fix:** Cards use Pointer Events API (`onPointerDown/Move/Up` + `setPointerCapture`).
+Bounds clamped to container via `clampPos()` in `CardItem`.
 
 ---
 
-## What's Built (Week 1 Complete)
+## What's Built (Weeks 1–2 Complete)
 
+### Week 1 — Core infrastructure
 - Room creation → unique slug → shareable URL
 - Socket.io join/leave/presence — live participant list
 - Host promotion when host leaves
@@ -216,12 +228,21 @@ entire canvas to remount and wipe all nodes. nodeTypes MUST stay at module level
 - Typing indicators (debounced, 2s timeout)
 - @ARIA detection and highlighting in chat
 - ARIA placeholder response in chat
-- ARIA avatar with animated status (idle/searching/done)
-- Board canvas (React Flow) — renders but BUG-001 affects display
-- Card pin/dismiss/drag (implemented, blocked by BUG-001)
+- ARIA avatar with animated status (idle/searching/reading/done)
+- Board canvas shell (React Flow background dots only after BUG-001 fix)
 - Manual note cards (+ Add note button)
 - Landing page with feature pills
 - Custom scrollbar + CSS animations
+
+### Week 2 — Board polish + card clustering
+- BUG-001 fixed: cards render as plain positioned divs, all 3 ARIA cards visible
+- BUG-002 fixed: full drag-to-move via Pointer Events API with bounds clamping
+- Smart card positioning: `findFreePosition` grid algorithm in gateway (3-col, reading order)
+- Z-index stacking: bring-to-front on pointer-down, pinned cards float above all others
+- Session clustering: ARIA cards grouped by `sessionId` with a shared frame overlay
+- Card dismiss animation: `anim-card-dismiss` 200ms scale-out before removal
+- Content truncation: "Show more / Show less" toggle at 120 chars
+- Board toolbar: live card count + two-click "Clear unpinned" with 3s confirm timeout
 
 ---
 
@@ -295,9 +316,9 @@ npm run dev
    All room state lives in `roomManager.ts`. Board state lives in the `boardState` Map
    in `events.ts`. Both reset on server restart (acceptable for v1).
 
-6. **TypeScript in Board.tsx:** React Flow requires node data to extend
-   `Record<string, unknown>`. Cast board card data with:
-   `data: card as unknown as Record<string, unknown>`
+6. **Board cards are NOT React Flow nodes.** Cards are plain `position: absolute` divs
+   rendered in an overlay div over the React Flow canvas. Do not add cards as RF nodes.
+   React Flow is used only for the dot-grid background (empty `<ReactFlow nodes={[]} />`).
 
 7. **Do not add voice/video in v1.** This is explicitly out of scope. WebRTC complexity
    would add 4-6 weeks. Deferred to v2.
@@ -312,8 +333,8 @@ npm run dev
 | Week | Focus | Status |
 |---|---|---|
 | 1 | Room + Chat + Board infrastructure | ✅ Complete |
-| 2 | Board polish + card clustering | ⬜ Next |
-| 3 | Real ARIA agents (Tavily + Claude) | ⬜ |
+| 2 | Board polish + card clustering | ✅ Complete |
+| 3 | Real ARIA agents (Tavily + Claude) | ⬜ Next |
 | 4 | Claude summarization + streaming | ⬜ |
 | 5 | Parallel agents + arq queue | ⬜ |
 | 6 | Synthesizer + Report generation | ⬜ |
