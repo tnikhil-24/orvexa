@@ -192,6 +192,8 @@ export function registerEvents(io: Server, socket: Socket): void {
         boardState.set(slug, board)
 
         // Stream cards one by one with delay — the "live appearance" effect
+        io.to(slug).emit('aria:status', { status: 'reading' })
+
         cards.forEach((card, index) => {
           setTimeout(() => {
             io.to(slug).emit('board:card:new', { card })
@@ -209,7 +211,13 @@ export function registerEvents(io: Server, socket: Socket): void {
           isAriatrigger: false,
         })
 
-        io.to(slug).emit('aria:status', { status: 'idle' })
+        // After all cards have streamed: done → idle
+        setTimeout(() => {
+          io.to(slug).emit('aria:status', { status: 'done' })
+          setTimeout(() => {
+            io.to(slug).emit('aria:status', { status: 'idle' })
+          }, 2500)
+        }, (cards.length - 1) * 600 + 200)
       }, 1500)
     }
   })
