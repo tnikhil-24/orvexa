@@ -27,6 +27,7 @@ export interface BoardCard {
   position: { x: number; y: number }
   sessionId?: string
   queryText?: string
+  isStreaming?: boolean
   createdBy: string
   createdAt: string
 }

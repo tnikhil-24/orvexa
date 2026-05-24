@@ -57,6 +57,73 @@ export function initRedisSubscriber(io: Server): void {
       return
     }
 
+    // ── STREAM START ─────────────────────────────────────────
+    if (type === 'stream_start') {
+      if (sessionId && !activeSessions.has(sessionId)) {
+        activeSessions.add(sessionId)
+        io.to(slug).emit('aria:status', { status: 'reading' })
+      }
+
+      if (!boardState.has(slug)) {
+        boardState.set(slug, [])
+      }
+      const board = boardState.get(slug)!
+
+      const card: BoardCard = {
+        id:          payload.cardId as string,
+        type:        'aria',
+        agentType:   payload.agentType as string | undefined,
+        title:       (payload.title as string) || 'Untitled',
+        content:     '',
+        pinned:      false,
+        isStreaming: true,
+        position:    findFreePosition(board, 0),
+        sessionId,
+        queryText:   payload.queryText as string | undefined,
+        createdBy:   'ARIA',
+        createdAt:   new Date().toISOString(),
+      }
+
+      board.push(card)
+      io.to(slug).emit('board:card:new', { card })
+      console.log(`[redis] stream_start ${card.id} (${card.agentType}) → ${slug}`)
+      return
+    }
+
+    // ── STREAM CHUNK ──────────────────────────────────────────
+    if (type === 'stream_chunk') {
+      const cardId = payload.cardId as string
+      const chunk  = payload.chunk  as string
+      const board  = boardState.get(slug)
+      if (!board) return
+      const card = board.find(c => c.id === cardId)
+      if (!card) return
+      card.content += chunk
+      io.to(slug).emit('board:card:content', { cardId, chunk })
+      return
+    }
+
+    // ── STREAM END ────────────────────────────────────────────
+    if (type === 'stream_end') {
+      const cardId = payload.cardId as string
+      const board  = boardState.get(slug)
+      if (!board) return
+      const card = board.find(c => c.id === cardId)
+      if (!card) return
+      card.isStreaming = false
+      if (typeof payload.finalContent   === 'string')  card.content         = payload.finalContent
+      if (typeof payload.confidenceScore === 'number')  card.confidenceScore = payload.confidenceScore
+      if (typeof payload.hasConflict     === 'boolean') card.hasConflict     = payload.hasConflict
+
+      const completePayload: Record<string, unknown> = { cardId }
+      if (typeof payload.confidenceScore === 'number')  completePayload.confidenceScore = payload.confidenceScore
+      if (typeof payload.hasConflict     === 'boolean') completePayload.hasConflict     = payload.hasConflict
+      if (typeof payload.finalContent    === 'string')  completePayload.finalContent    = payload.finalContent
+      io.to(slug).emit('board:card:complete', completePayload)
+      console.log(`[redis] stream_end ${cardId} → ${slug}`)
+      return
+    }
+
     // ── CARD (aria or error) ──────────────────────────────────
     if (type !== 'aria' && type !== 'error') return
 

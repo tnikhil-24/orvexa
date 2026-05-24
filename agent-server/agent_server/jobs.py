@@ -28,27 +28,37 @@ async def _run_with_timeout(
     try:
         await asyncio.wait_for(coro, timeout=timeout_secs)
     except asyncio.TimeoutError:
-        logger.warning("[%s] timed out after %ds", agent_type, timeout_secs)
-        await publish_finding(redis_url, slug, {
-            "type": "error",
-            "agentType": agent_type,
-            "title": f"{agent_type.capitalize()} timed out",
-            "content": f"No response within {timeout_secs}s. The agent may be overloaded.",
-            "sessionId": session_id,
-            "queryText": query,
-            "slug": slug,
-        })
+        if agent_type == "search":
+            await publish_finding(redis_url, slug, {
+                "type": "error",
+                "agentType": agent_type,
+                "title": "Search timed out",
+                "content": f"No results within {timeout_secs}s.",
+                "sessionId": session_id,
+                "queryText": query,
+                "slug": slug,
+            })
+        else:
+            logger.warning(
+                "[%s] timed out after %ds — stream_end published by agent",
+                agent_type, timeout_secs,
+            )
     except Exception as e:
-        logger.error("[%s] failed: %s", agent_type, e)
-        await publish_finding(redis_url, slug, {
-            "type": "error",
-            "agentType": agent_type,
-            "title": f"{agent_type.capitalize()} failed",
-            "content": str(e)[:200],
-            "sessionId": session_id,
-            "queryText": query,
-            "slug": slug,
-        })
+        if agent_type == "search":
+            await publish_finding(redis_url, slug, {
+                "type": "error",
+                "agentType": agent_type,
+                "title": "Search failed",
+                "content": str(e)[:200],
+                "sessionId": session_id,
+                "queryText": query,
+                "slug": slug,
+            })
+        else:
+            logger.error(
+                "[%s] failed: %s — stream_end published by agent",
+                agent_type, str(e)[:200],
+            )
 
 
 async def aria_job(ctx, slug: str, query: str, session_id: str) -> None:

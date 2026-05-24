@@ -16,8 +16,8 @@ shared visual board that all participants see simultaneously.
 **One-liner for context:** "Figma meets Perplexity — a live research room where AI does
 the searching while your team watches the board fill up in real time."
 
-**Current state:** Week 3 of a 12-week build. Real AI agents live — Tavily search +
-Claude summarization + fact-check stream cards onto the board in real time.
+**Current state:** Week 4 of a 12-week build. Real AI agents live with full streaming —
+Tavily search + Claude summarizer + fact-check stream text word-by-word onto the board.
 
 ---
 
@@ -111,7 +111,7 @@ Gateway → callback({success, participants, board})
 Gateway → socket.to(slug).emit('room:presence', {participants})
 ```
 
-### @ARIA trigger flow (current — real agents):
+### @ARIA trigger flow (current — streaming agents):
 ```
 User types "@ARIA [query]" → Chat.tsx → socket.emit('chat:message')
 Gateway → detects @ARIA → emits aria:status 'searching'
@@ -119,15 +119,38 @@ Gateway → axios.POST http://localhost:8000/api/aria/trigger {slug, query, sess
 FastAPI → enqueues aria_job in arq (Redis-backed queue)
 arq worker → picks up job → runs two-phase execution:
   Phase 1 (sequential): run_search() → Tavily API → up to 5 results
-    Each result → redis.asyncio.publish(room:{slug}:findings, card JSON)
+    Each result → redis.asyncio.publish(room:{slug}:findings, {type:'aria', ...card})
   Phase 2 (parallel): asyncio.gather(run_summarizer(), run_factcheck())
-    Both use Phase 1 results → Claude Sonnet API → publish summary + factcheck cards
-  Each phase has 30s timeout → timeout/exception → error card published instead
+    Summarizer: generates card_id → publishes {type:'stream_start'} → streams Claude
+      response → publishes {type:'stream_chunk', chunk} per delta → publishes
+      {type:'stream_end'} in finally block (fires even on error)
+    Factcheck: same pattern, but accumulates full text → in finally: parses
+      CONFIDENCE score via regex, strips CONFIDENCE line, detects conflicts →
+      publishes stream_end with {finalContent, confidenceScore, hasConflict}
+  Each phase has 30s timeout → timeout/exception → error card or partial stream_end
   After gather: publish {type:'done'} to Redis channel
 Gateway redis.ts → psubscribe('room:*:findings') → pmessage handler:
   type 'aria'/'error' → findFreePosition + push boardState + emit board:card:new
+  type 'stream_start' → same activeSessions logic + create card with isStreaming:true
+    using Python-provided cardId verbatim → push boardState → emit board:card:new
+  type 'stream_chunk' → find card by cardId + append chunk to boardState content
+    → emit board:card:content {cardId, chunk}
+  type 'stream_end' → set isStreaming:false + apply finalContent/confidenceScore/
+    hasConflict if present → emit board:card:complete {cardId, ...optional fields}
   First card of session → emit aria:status 'reading' (before emitting card)
   type 'done' → emit aria:status 'done' → 2500ms → emit aria:status 'idle'
+Frontend Board.tsx:
+  board:card:new → add card to state; if card.isStreaming: start 60s safety timer
+  board:card:content → append chunk to card.content via setCards
+  board:card:complete → cancel safety timer, set isStreaming:false, apply optional fields
+  CardItem: shows blinking ▌ cursor (anim-aria-thinking) while card.isStreaming === true
+    truncation disabled while streaming; cursor gone after board:card:complete
+
+### Streaming Redis message schema:
+  stream_start:  {type, cardId, agentType, title, sessionId, queryText, slug}
+  stream_chunk:  {type, cardId, chunk, slug}
+  stream_end:    {type, cardId, slug, confidenceScore?, hasConflict?, finalContent?}
+  (stream_end optional fields only present when agent has values to report)
 ```
 
 ---
@@ -160,6 +183,8 @@ Gateway redis.ts → psubscribe('room:*:findings') → pmessage handler:
 | `board:card:update` | `{cardId, pinned}` | Card pin state changed |
 | `board:card:dismiss` | `{cardId}` | Card removed |
 | `board:card:move` | `{cardId, x, y}` | Card position changed |
+| `board:card:content` | `{cardId, chunk}` | Streaming text chunk to append to card |
+| `board:card:complete` | `{cardId, confidenceScore?, hasConflict?, finalContent?}` | Stream finished; cursor removed |
 
 ---
 
@@ -178,7 +203,11 @@ frontend/
                               plain position:absolute divs (BUG-001 fix). Manages:
                               BoardCard state, z-index stacking, pointer-events drag
                               with bounds clamping, pin/dismiss animations, session
-                              cluster frames, board toolbar with "Clear unpinned"
+                              cluster frames, board toolbar with "Clear unpinned".
+                              Streaming: streamTimers ref (Map<cardId, timeout>),
+                              board:card:content appends chunks, board:card:complete
+                              finalizes. isStreaming flag on BoardCard shows ▌ cursor.
+                              60s safety timer auto-clears cursor if stream_end missed.
       Chat.tsx              — Chat sidebar. Messages, typing indicators, @ARIA highlighting
       ARIAAvatar.tsx        — Animated ARIA avatar. Reacts to aria:status socket events
   lib/
@@ -192,10 +221,17 @@ gateway/
                               @ARIA handler: emits 'searching', POSTs to Python, done.
                               BoardCard.type includes 'error' for agent failure cards.
     redis.ts                — ioredis subscriber. psubscribe('room:*:findings').
-                              pmessage → parse slug from channel → build card →
-                              push boardState → emit board:card:new. Tracks first card
-                              per session to emit aria:status 'reading' exactly once.
-                              Handles 'done' message → 'done' + 2500ms → 'idle'.
+                              pmessage → parse slug from channel → dispatch by type:
+                              'aria'/'error' → build card + emit board:card:new.
+                              'stream_start' → build card with isStreaming:true using
+                              Python-provided cardId + emit board:card:new.
+                              'stream_chunk' → append chunk to boardState + emit
+                              board:card:content {cardId, chunk}.
+                              'stream_end' → set isStreaming:false + apply optional
+                              finalContent/confidenceScore/hasConflict + emit
+                              board:card:complete (only present fields emitted).
+                              'done' → emit aria:status 'done' → 2500ms → 'idle'.
+                              Tracks activeSessions for aria:status 'reading' once.
                               CRITICAL: call psubscribe() directly (not in connect handler)
                               — ioredis queues it. Putting it in connect re-subscribes
                               on every reconnect and caused BUG-003 (0 subscribers).
@@ -218,11 +254,13 @@ agent-server/
     agents/
       search.py             — Tavily POST /search, max 5 results. Publishes each as
                               agentType:'search' card. Returns results list for Phase 2.
-      summarizer.py         — Claude Sonnet, top 3 snippets, 2-3 sentence summary.
-                              Empty results → error card, no blank Claude prompt.
-      factcheck.py          — Claude Sonnet, confidence score parsed via regex
-                              r'CONFIDENCE:\s*([0-9]*\.?[0-9]+)', clamped [0,1].
-                              hasConflict set if response contains 'conflict'/'contradicts'.
+      summarizer.py         — Claude Sonnet streaming. Publishes stream_start → streams
+                              chunks → stream_end in finally. Empty results → error card.
+      factcheck.py          — Claude Sonnet streaming. Accumulates full text, then in
+                              finally: parses CONFIDENCE via regex, strips line from
+                              content, detects conflicts. stream_end carries finalContent
+                              + confidenceScore + hasConflict. Partial stream on timeout
+                              still fires finally → defaults confidence 0.5.
 
 db/
   init.sql                  — Full PostgreSQL schema. 6 tables: rooms, participants,
@@ -283,6 +321,19 @@ Bounds clamped to container via `clampPos()` in `CardItem`.
 - Per-agent 30s timeouts: timeout/exception produces error card, others continue
 - Error card visual style: red-tinted border + background, red title in Board.tsx
 - `aria:status` lifecycle now data-driven: reading on first Redis card, done on Python signal
+
+### Week 4 — Claude summarization + streaming
+- Streaming summarizer: stream_start → stream_chunk per delta → stream_end in finally
+- Streaming factcheck: same pattern + accumulates text → parses confidence + strips
+  CONFIDENCE line + detects conflicts → stream_end carries finalContent/confidenceScore/hasConflict
+- Gateway redis.ts: handles stream_start/stream_chunk/stream_end message types;
+  emits board:card:content and board:card:complete socket events
+- Frontend Board.tsx: board:card:content appends chunks live; board:card:complete
+  finalizes card; blinking ▌ cursor while isStreaming; truncation disabled during stream
+- 60s safety timer per streaming card — auto-clears cursor if stream_end never arrives
+- Interruption resilience: arq kill → partial content stays + cursor auto-clears after 60s;
+  agent-server down → W2 5s fallback timer returns avatar to idle; Redis restart → ioredis
+  reconnects automatically, next query works normally
 
 ---
 
@@ -391,8 +442,8 @@ arq agent_server.worker.WorkerSettings
 | 1 | Room + Chat + Board infrastructure | ✅ Complete |
 | 2 | Board polish + card clustering | ✅ Complete |
 | 3 | Real ARIA agents (Tavily + Claude) | ✅ Complete |
-| 4 | Claude summarization + streaming | ⬜ Next |
-| 5 | Parallel agents + arq queue | ⬜ |
+| 4 | Claude summarization + streaming | ✅ Complete |
+| 5 | Parallel agents + arq queue | ⬜ Next |
 | 6 | Synthesizer + Report generation | ⬜ |
 | 7 | Auth (Clerk) + DB persistence | ⬜ |
 | 8 | UI polish + error handling | ⬜ |

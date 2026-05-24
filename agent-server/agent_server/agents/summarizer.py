@@ -1,4 +1,5 @@
 import logging
+import uuid
 
 import anthropic
 from dotenv import load_dotenv
@@ -38,33 +39,46 @@ async def run_summarizer(
         f"in 2-3 sentences. Focus on the key findings.\n\n{snippets}"
     )
 
-    async with anthropic.AsyncAnthropic() as client:
-        response = await client.messages.create(
-            model="claude-sonnet-4-6",
-            max_tokens=300,
-            messages=[{"role": "user", "content": prompt}],
-        )
-
-    if not response.content or not response.content[0].text:
-        await publish_finding(redis_url, slug, {
-            "type": "error",
-            "agentType": "summary",
-            "title": "Empty response from Claude",
-            "content": "Claude returned an empty response. Please try again.",
-            "sessionId": session_id,
-            "queryText": query,
-            "slug": slug,
-        })
-        return
-    summary_text = response.content[0].text
-
+    card_id = str(uuid.uuid4())
     await publish_finding(redis_url, slug, {
-        "type": "aria",
+        "type": "stream_start",
+        "cardId": card_id,
         "agentType": "summary",
         "title": f'Summary: "{query}"',
-        "content": summary_text,
         "sessionId": session_id,
         "queryText": query,
         "slug": slug,
     })
-    logger.info("[summarizer] published summary for %r", query)
+
+    stream_end_published = False
+    try:
+        try:
+            async with anthropic.AsyncAnthropic() as client:
+                async with client.messages.stream(
+                    model="claude-sonnet-4-6",
+                    max_tokens=300,
+                    messages=[{"role": "user", "content": prompt}],
+                ) as stream:
+                    async for text in stream.text_stream:
+                        await publish_finding(redis_url, slug, {
+                            "type": "stream_chunk",
+                            "cardId": card_id,
+                            "chunk": text,
+                            "slug": slug,
+                        })
+        finally:
+            stream_end_published = True
+            await publish_finding(redis_url, slug, {
+                "type": "stream_end",
+                "cardId": card_id,
+                "slug": slug,
+            })
+    except Exception:
+        if not stream_end_published:
+            await publish_finding(redis_url, slug, {
+                "type": "stream_end",
+                "cardId": card_id,
+                "slug": slug,
+            })
+        raise
+    logger.info("[summarizer] streamed summary for %r", query)
